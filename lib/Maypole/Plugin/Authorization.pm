@@ -4,7 +4,7 @@ use warnings;
 
 # This module provides role-based authorization for Maypole
 
-our $VERSION = '0.05';
+our $VERSION = '0.10';
 
 # 2005-01-27 djh v0.03	Modified get_authorized_* to make them work and
 #			accept arguments, and improved docs
@@ -12,82 +12,148 @@ our $VERSION = '0.05';
 # 			example for get_authorized_methods. Thanks to
 #			Josef Chladek.
 # 2005-02-08 djh v0.05	Improved error checking in authorize.
+# 2005-08-20 djh v0.06	Improved docs suggested by Kieren Diment.
+# 2005-08-20 djh v0.07	Added config options from Peter Speltz.
+# 2005-08-22 djh v0.08	Added user_class default from Kieren Diment
+# 2005-08-22 djh v0.09	Default {} if no config->auth
+# 2005-08-24 djh v0.10	Allow entity other than model_class as requested
+#			by Kieren Diment & Peter Speltz
 
-# We can determine whether a given user_id is authorized to invoke a
-# particular method in a model_class using the following SQL query:
 
-my $_check_auth_sql = <<SQL ;
-    SELECT p.id FROM permissions AS p, role_assignments AS r
-    WHERE r.user_id  = ? 
-    AND   p.model_class = ?
-    AND  (p.method = ? OR p.method = '*')
-    AND   p.auth_role_id = r.auth_role_id
-    LIMIT 1
-SQL
+#=======================================================================
+#
+# Initialization
+
+Maypole::Config->mk_accessors('auth') unless Maypole::Config->can('auth');
+
+
+# Code references to database queries could be cached at load time,
+# except that Maypole::Application doesn't call our import function!
+
+# Authorization checking query for use by authorize()
+my $_cdbi_class;
+my $_check_authorization;
+
+sub _init_authorization_query {
+    my $r = shift;
+
+    # Build a SQL query that checks whether a given user_id is
+    # authorized to invoke a particular method in a model_class
+    # and add it to a class that can run SQL queries for us
+    my $conf     = $r->config->auth || {};
+    my $p_table  = $conf->{permission_table}  || 'permissions';
+    my $ra_table = $conf->{role_assign_table} || 'role_assignments';
+    my $user_fk  = $conf->{user_fk}	      || 'user_id';
+    $_cdbi_class = $conf->{user_class}        || (ref $r).'::User';
+
+    $_cdbi_class->set_sql(check_authorization => 
+	"SELECT p.id FROM $p_table AS p, $ra_table AS r
+	  WHERE r.$user_fk  = ? 
+	  AND   p.model_class = ?
+	  AND  (p.method = ? OR p.method = '*')
+	  AND   p.auth_role_id = r.auth_role_id
+	  LIMIT 1");
+
+    $_check_authorization = $_cdbi_class->can('sql_check_authorization');
+}
+
+
+# Query to find lists of authorized methods for get_authorized_classes()
+my $_get_authorized_classes;
+
+sub _init_get_authorized_classes {
+    my $r = shift;
+
+    my $conf     = $r->config->auth || {};
+    my $p_table  = $conf->{permission_table}  || 'permissions';
+    my $ra_table = $conf->{role_assign_table} || 'role_assignments';
+    my $user_fk  = $conf->{user_fk}	      || 'user_id';
+    $_cdbi_class = $conf->{user_class}        || (ref $r).'::User';
+
+    $_cdbi_class->set_sql(get_authorized_classes => 
+	"SELECT DISTINCT p.model_class FROM $p_table AS p, $ra_table AS r
+	  WHERE r.$user_fk = ?
+	  AND   p.auth_role_id = r.auth_role_id");
+
+    $_get_authorized_classes =
+	$_cdbi_class->can('sql_get_authorized_classes');
+}
+
+
+# Query to find lists of authorized methods for get_authorized_methods()
+my $_get_authorized_methods;
+
+sub _init_get_authorized_methods {
+    my $r = shift;
+
+    my $conf     = $r->config->auth || {};
+    my $p_table  = $conf->{permission_table}  || 'permissions';
+    my $ra_table = $conf->{role_assign_table} || 'role_assignments';
+    my $user_fk  = $conf->{user_fk}	      || 'user_id';
+    $_cdbi_class = $conf->{user_class}        || (ref $r).'::User';
+
+    $_cdbi_class->set_sql(get_authorized_methods =>
+	"SELECT p.method FROM $p_table AS p, $ra_table AS r
+	  WHERE r.$user_fk = ?
+	  AND   p.model_class = ?
+	  AND   p.auth_role_id = r.auth_role_id");
+
+    $_get_authorized_methods =
+	 $_cdbi_class->can('sql_get_authorized_methods');
+}
+
+
+#=======================================================================
 
 # Main permission-checking method
 
 sub authorize {
-    my ($self, $r) = @_;
+    my ($self, $r, $entity) = @_;
 
-    # Extract values for permission check
-    return undef unless $r->user;
+    # Validate and extract values for permission check
+    $entity	 ||= $r->model_class;
+    return undef unless $r->user and $entity;
     my $userid     = $r->user->id;
     my $method     = $r->action;
-    my $class      = $r->model_class;
-    return undef unless $class;
 
-    # Find a class that can run SQL queries for us and make sure the SQL
-    # query has been prepared
-    my $cdbi_class = $r->config->auth->{user_class};
-    $cdbi_class->set_sql(check_authorization => $_check_auth_sql)
-        unless $cdbi_class->can('sql_check_authorization');
-
-    # Check the permissions
-    return $cdbi_class->sql_check_authorization
-			->select_val($userid, $class, $method);
+    # Make sure the SQL query has been prepared, then check the permissions
+    _init_authorization_query($r) unless $_check_authorization;
+    return $_cdbi_class->sql_check_authorization->
+				select_val($userid, $entity, $method);
 }
 
 
-# Auxiliary methods for finding lists of authorized classes and methods
-
-my $_get_auth_classes_sql = <<SQL ;
-    SELECT DISTINCT p.model_class
-    FROM   permissions AS p, role_assignments AS r
-    WHERE  r.user_id = ?
-    AND    r.auth_role_id = p.auth_role_id
-SQL
+# Auxiliary method for finding list of authorized classes
 
 sub get_authorized_classes {
     my ($r, $userid) = @_;
+
+    # Validate and extract parameters
     return unless $r->user or $userid;
     $userid ||= $r->user->id;
-    my $cdbi_class = $r->config->auth->{user_class};
-    $cdbi_class->set_sql(get_authorized_classes => $_get_auth_classes_sql)
-        unless $cdbi_class->can('sql_get_authorized_classes');
-    my $sth = $cdbi_class->sql_get_authorized_classes;
+
+    # Make sure the SQL query has been prepared, then run it
+    _init_get_authorized_classes($r) unless $_get_authorized_classes;
+    my $sth = $_cdbi_class->sql_get_authorized_classes;
     $sth->execute($userid);
     return map { $_->[0] } @{$sth->fetchall_arrayref};
 }
 
 
-my $_get_auth_methods_sql = <<SQL ;
-    SELECT p.method FROM permissions AS p, role_assignments AS r
-    WHERE r.user_id  = ? 
-    AND   p.model_class = ?
-    AND   p.auth_role_id = r.auth_role_id
-SQL
+# Auxiliary method for finding list of authorized methods
 
 sub get_authorized_methods {
     my ($r, $userid, $class) = @_;
+
+    # Validate and extract parameters
     return unless $r->user or $userid;
     $userid ||= $r->user->id;
     $class  ||= $r->model_class;
     return unless $class;
-    my $cdbi_class = $r->config->auth->{user_class};
-    $cdbi_class->set_sql(get_authorized_methods => $_get_auth_methods_sql)
-        unless $cdbi_class->can('sql_get_authorized_methods');
-    my $sth = $cdbi_class->sql_get_authorized_methods;
+
+    # Make sure the SQL query has been prepared, then run it
+    _init_get_authorized_methods($r) unless $_get_authorized_methods;
+    my $sth = $_cdbi_class->sql_get_authorized_methods;
     $sth->execute($userid, $class);
     return map { $_->[0] } @{$sth->fetchall_arrayref};
 }
@@ -102,16 +168,25 @@ Maypole::Plugin::Authorization - Provide role-based authorization for Maypole ap
 
 =head1 SYNOPSIS
 
+  # In your main application driver class ...
+
   package BeerDB;
   use Maypole::Application qw(
 	Authentication::UserSessionCookie
 	Authorization);
   use Maypole::Constants;
 
+  # Configuration will depend on the database design, which loader is
+  # used etc, so this is just one possibility ...
+  BeerDB->config->auth({
+    user_class => 'BeerDB::Users',
+    # other keys may be needed as well for the authentication module
+  });
+
   sub authenticate {
     my ($self, $r) = @_;
     ...
-    if $self->authorize($r) {
+    if ($self->authorize($r)) {
         return OK;
     } else {
         # take application-specific authorization failure action
@@ -129,6 +204,7 @@ Maypole::Plugin::Authorization - Provide role-based authorization for Maypole ap
   }
 
   # meanwhile in a template somewhere ...
+
   [% ok_methods = request.get_authorized_methods %]
   Can be used to decide whether to display an edit button, for example
 
@@ -143,6 +219,43 @@ I<methods> in I<classes>. Normally these will be I<actions> in model
 classes. Permission to invoke methods is not granted directly; it is
 assigned to I<roles>, and each user may be assigned one or more roles.
 
+The methods made available in your request object are described next,
+followed by an example database schema. Then we explain how you can
+customize the schema using configuration. Finally there are some hints
+on how to administer the database tables and a list of the various use
+cases associated with authorization.
+
+As well as this description there are a few other files shipped in the
+distribution that you may want to look at:
+
+=over
+
+=item t/beerdb.db
+
+A sqlite database containing tables and data for the example beer
+database, along with authorization tables and data.
+
+=item t/beerdb.sql
+
+A file containing SQL to create and load the sqlite database
+
+=item ex/beer_d_b.sql
+
+A file containing SQL to create and load a MySQL InnoDB version of the
+database.
+
+=item ex/BeerDB.pm
+
+An example of a Maypole driver class that uses authorization. It may get
+you started towards your own application.
+
+Note that there is a different F<BeerDB.pm> in the F<t> directory that
+is just designed to make the tests run, not to help you!
+
+=back
+
+
+=head1 METHODS
 
 =head2 authorize
 
@@ -155,7 +268,7 @@ from elsewhere if desired.
     sub authenticate {
         my ($self, $r) = @_;
         ...
-        if $self->authorize($r) {
+        if ($self->authorize($r)) {
             return OK;
         } else {
             # take application-specific auth failure action
@@ -171,6 +284,22 @@ If such a request gets this far, we just turn it down.
 Similarly, C<authenticate> needs to handle requests with no user without
 calling C<authorize>.
 
+Normally, C<authorize()> uses information in the request (C<$r>) to decide
+whether to grant authorization. In particular, it checks whether the
+C<permissions> table has a record matching the request's I<model class>
+and I<action> with the user. It is possible to vary this scheme and store
+different information in the permissions table instead of the model class,
+perhaps the class's C<moniker> or the name of its associated database table.
+To do this, make sure that you have the right values in the permissions table,
+and pass the value to be tested explicitly to authorize(). For example:
+
+  $authorized = $self->authorize($r, $r->model_class->moniker);
+
+or
+
+  $authorized = $self->authorize($r, $r->table);
+
+
 =head2 get_authorized_classes
 
   $r->get_authorized_classes;		# current user
@@ -180,6 +309,7 @@ C<get_authorized_classes> returns the list of classes for which the
 current user has some permissions. This can be used to build the list of
 tabs in the navbar, for instance. If called with a user id as argument,
 it returns the list of classes for which that user has some permissions.
+
 
 =head2 get_authorized_methods
 
@@ -191,9 +321,11 @@ it returns the list of classes for which that user has some permissions.
 
   $r->get_authorized_methods($user_id, $class_name);
   # methods specific user can execute in nominated model class
+  # (or use moniker or table name etc in place of the model class)
 
   $r->get_authorized_methods(undef, $class_name);
   # methods current user can execute in nominated model class
+  # (or use moniker or table name etc in place of the model class)
 
 C<get_authorized_methods> finds the list of methods that the current
 user is entitled to invoke on the current model class. This can be used
@@ -203,6 +335,9 @@ execute in the current model class. Similarly, if called with a class
 name, it returns the list of methods that the current user can execute
 in that class, while if called with both as arguments, it returns the
 list of methods the given user is allowed to call in the stated class.
+
+Like C<authorize()>, it is possible to use some other value instead of
+the model class, provided that the permissions has matching values.
 
 Here is an example of a possible way to use this method in templates to
 decide whether to display buttons for various actions that a user may or
@@ -219,8 +354,8 @@ may not be authorized to use:
 
   [% ok_methods = request.get_authorized_methods ;
      FOR meth = ok_methods ;
-          if_auth_button(item, "edit", meth) ;
-          if_auth_button(item, "delete", meth) ;
+          if_auth_button(item, 'edit', meth) ;
+          if_auth_button(item, 'delete', meth) ;
      END ;
   %]
 
@@ -234,10 +369,13 @@ The module depends on four database tables to store the necessary data.
 =item users
 
 The C<users> table records details of each individual who has an account
-on the system. It is also used by
-L<Maypole::Plugin:Authentication::UserSessionCookie> to do user
-authentication and session management. Additional columns can be added
-to suit whatever other needs you have.
+on the system.
+It is not used by this module; only the id values are used as foreign
+keys in the role_assignments table.
+This table is used by L<Maypole::Plugin:Authentication::UserSessionCookie>
+to do user authentication and session management. 
+Refer to that module to understand the columns in this table.
+Additional columns can be added to suit whatever other needs you have.
 
 =item auth_roles
 
@@ -246,8 +384,8 @@ explosion in the table size and an administrative headache.
 Instead roles are given permissions and users acquire those permissions
 by being assigned to roles. The C<auth_roles> table just records the
 name of the role. You could add things like a description if you wish.
-The table is not called C<roles> so that the name is left free for your
-application to use.
+The table is not called C<roles> in case your application wants to use
+that name for its own purposes.
 
 =item role_assignments
 
@@ -267,7 +405,17 @@ that you want to allow on B<all> classes!
 
 =back
 
-The table definitions to implement this scheme look like this:
+One possible set of table definitions (DDL) to implement this scheme are
+shown below. The DDL uses various MySQL features and you may need to adapt
+it for other databases. The DDL also uses the InnoDB table type, because
+this supports foreign key checks within the database and it allows us to
+show how these constraints should be set up. You can use other table types
+and rely on L<Class::DBI> to maintain integrity. If you do this, remove
+'TYPE=InnoDB' from the end of each table definition.
+
+Note that in some Linux distributions InnoDB support is in a different
+package to the base MySQL release. So if you have trouble, use your
+distribution's package manager to check that InnoDB support is installed.
 
   CREATE TABLE users (
 	id		INT NOT NULL AUTO_INCREMENT,
@@ -275,13 +423,13 @@ The table definitions to implement this scheme look like this:
 	UID		VARCHAR(20) NOT NULL,
 	password	VARCHAR(20) NOT NULL,
 	PRIMARY KEY (id),
-	UNIQUE (UID),
+	UNIQUE (UID)
   ) TYPE=InnoDB;
 
   CREATE TABLE auth_roles (
 	id		INT NOT NULL AUTO_INCREMENT,
 	name		VARCHAR(40) NOT NULL,
-	PRIMARY KEY (id),
+	PRIMARY KEY (id)
   ) TYPE=InnoDB;
 
   CREATE TABLE role_assignments (
@@ -292,7 +440,7 @@ The table definitions to implement this scheme look like this:
 	UNIQUE (user_id, auth_role_id),
 	INDEX (auth_role_id),
 	FOREIGN KEY (user_id) REFERENCES users (id),
-	FOREIGN KEY (auth_role_id) REFERENCES auth_roles (id),
+	FOREIGN KEY (auth_role_id) REFERENCES auth_roles (id)
   ) TYPE=InnoDB;
 
   CREATE TABLE permissions (
@@ -304,29 +452,44 @@ The table definitions to implement this scheme look like this:
 	UNIQUE (auth_role_id, model_class, method),
 	INDEX (model_class(20)),
 	INDEX (method(20)),
-	FOREIGN KEY (auth_role_id) REFERENCES auth_roles (id),
+	FOREIGN KEY (auth_role_id) REFERENCES auth_roles (id)
   ) TYPE=InnoDB;
 
 
-=head1 PROCESSING
+=head1 CONFIGURATION
 
-We can determine whether a given C<user_id> is authorized to invoke a
-particular C<method> in a C<model_class> using the following SQL query:
+Maypole::Plugin::Authorization runs without any configuration,
+sharing the C<auth> component of your Maypole configuration with
+whichever authentication plugin you are using.
+You can also customize some aspects of it with explicit configuration:
 
-    SELECT p.id FROM permissions AS p, role_assignments AS r
-    WHERE r.user_id  = ? 
-    AND   p.model_class = ?
-    AND  (p.method = ? OR p.method = '*')
-    AND   p.auth_role_id = r.auth_role_id
-    LIMIT 1
+=over
 
-This query is executed in the C<authorize> method which is
-called from the driver's C<authenticate> method. (Maypole's terminology
-is a little confused about authentication and authorization but the
-code works the same either way!)
+=item user_class
+
+The name of the model subclass that represents the I<users> table.
+It defaults to C<BeerDB::User>, where C<BeerDB> is the name of your
+application driver class.
+This subclass is used to execute the authorization SQL queries.
+
+=item permission_table
+
+The name of the permissions table. It defaults to I<permissions>.
+
+=item role_assign_table
+
+The name of the table that assigns users to roles.
+It defaults to I<role_assignments>.
+
+=item user_fk
+
+The name of the foreign key column in the role assignment table that
+identifies the user. It defaults to I<user_id>.
+
+=back
 
 
-=head2 administration
+=head1 ADMINISTRATION
 
 The permissions database can be maintained by any person who is assigned
 to the I<admin> role. Most administration is performed using normal
@@ -346,7 +509,8 @@ There is a I<default> role that should be assigned to every user.
 Perhaps it should be hardwired in the SQL so that users don't have to be
 actually added to the role?
 
-=head2 Use Cases
+
+=head1 USE CASES
 
 =over
 
@@ -396,11 +560,12 @@ actions.
 
 =back
 
+
 =head1 ALTERNATIVES AND FUTURES
 
 There are several alternative possibilities for authorizable entities
 and permission checking in addition to the example implementation
-provided:
+provided. You can consider them if you have special requirements:
 
 1/ Authorize all actions (i.e. methods with the Exported attribute).
 Permission could be enforced in the model's process method just before
@@ -425,6 +590,9 @@ authorization.
 =head1 AUTHOR
 
 Dave Howorth, djh#cpan.org
+
+Please ask any questions on the L<Maypole> mailing list
+and monitor that list for any announcements.
 
 =head1 THANKS TO
 

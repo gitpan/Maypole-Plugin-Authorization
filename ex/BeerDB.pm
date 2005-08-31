@@ -1,72 +1,102 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+
+# This is an example Maypole application class that uses
+# Maypole::Plugin::Authorization, to help you to understand how to use
+# the authorization plugin. It hasn't been run recently, so I don't
+# guarantee it works! Learning how to fix it if necessary is a valuable
+# skill to have :)
+
+# Start off with pretty standard Maypole driver stuff ...
+
 package BeerDB;
-use lib 'lib'; # where Maypole::Plugin::Authorization lives
-use Maypole::Application (Authorization);
-#use Class::DBI::Loader::Relationship;
+use Maypole::Application qw(
+	-Debug
+	Authentication::UserSessionCookie
+	Authorization
+	);
 
-sub debug { $ENV{BEERDB_DEBUG} }
-# This is a test application for Maypole::Plugin::Authorization.
-use constant DATASOURCE => 't/beerdb.db';
+BeerDB->setup("dbi:mysql:beer_d_b");
+BeerDB->config->uri_base("http://localhost/cgi-bin/beer.cgi");
+BeerDB->config->template_root("/var/www/beerdb");
+BeerDB->config->rows_per_page(10);
+BeerDB->config->display_tables([qw[beer brewery pub style
+		users permissions auth_roles role_assignments
+    ]]);
+BeerDB::Brewery->untaint_columns( printable => [qw/name notes url/] );
+BeerDB::Pub->untaint_columns(     printable => [qw/name notes url/] );
+BeerDB::Style->untaint_columns(   printable => [qw/name notes/] );
+BeerDB::Beer->untaint_columns(
+        printable => [qw/abv name price notes/],
+        integer   => [qw/style brewery score/],
+        date      => [ qw/date/],
+    );
 
-BEGIN {
-    my $dbi_driver = 'SQLite';
-    die sprintf "SQLite datasource '%s' not found, correct the path or "
-        . "recreate the database by running Makefile.PL", DATASOURCE
-        unless -e DATASOURCE;
-    eval "require DBD::SQLite";
-    if ($@) {
-        eval "require DBD::SQLite2" and $dbi_driver = 'SQLite2';
-    }
-    BeerDB->setup(join ':', "dbi", $dbi_driver, DATASOURCE);
-}
+# Authorization stuff
 
+# Show UserSessionCookie where to find user and password
+BeerDB->config->auth({
+        user_class     => 'BeerDB::Users',
+        user_field     => 'UID',
+        password_field => 'password',	# this is actually the default
+    });
+
+# Make relationships between authorization tables so Maypole will
+# display them correctly (you can let Class::DBI::Loader or some other
+# module do this if you wish
+BeerDB::Permissions->has_a(    auth_role_id => 'BeerDB::AuthRoles');
+BeerDB::RoleAssignments->has_a(user_id      => 'BeerDB::Users');
+BeerDB::RoleAssignments->has_a(auth_role_id => 'BeerDB::AuthRoles');
+BeerDB::AuthRoles->has_many(users =>
+			[ 'BeerDB::RoleAssignments' => 'user_id' ]);
+BeerDB::Users->has_many(auth_roles =>
+			[ 'BeerDB::RoleAssignments' => 'auth_role_id' ]);
+
+# Declare the column types for the authorization tables so users will be
+# able to edit them using Maypole
+BeerDB::Users->untaint_columns(      printable => [qw/name UID password/]);
+BeerDB::AuthRoles->untaint_columns(  printable => [qw/name/]);
+BeerDB::Permissions->untaint_columns(printable =>
+			[qw/auth_role_id model_class method/]);
+BeerDB::RoleAssignments->untaint_columns(printable =>
+			[qw/user_id auth_role_id/]);
+
+# Here is an example of an 'authenticate' method that invokes the
+# Authorization module. Customize this to suit your needs.
+use Maypole::Constants;
 sub authenticate {
     my ($self, $r) = @_;
-
-    # Allow unrestricted access to frontpage
-    return Maypole::Constants::OK unless $r->model_class;
-
-    # BeerDB::Style is used to test error-handling for a missing user
-    return Maypole::Constants::OK if $r->model_class eq 'BeerDB::Style';
-
-    # Simulate authentication of user
-    $r->user(BeerDB::Users->retrieve(1));
-    
-    # Test authorize
-    $r->template('no_permission') unless $self->authorize($r);
-    return Maypole::Constants::OK;
+    $r->get_user;
+    if ($r->user) {
+        if ($r->template  &&  $r->template =~ /logout$/) {
+	    $r->logout; # user clicked on a logout link, so log him out
+	    $r->template('frontpage');
+	    return OK;
+	}
+        return OK unless $r->model_class; # let all users see frontpage etc
+        if ($self->authorize($r)) {
+            return OK;
+        } else {
+            # Maypole's strange way of saying DECLINED ...
+            $r->template('error');
+            $r->error("Sorry, you don't have permission to look at that");
+            return OK;
+        }
+    } else { # no current user
+        return OK if $r->table eq "users" and $r->action eq "subscribe";
+        $r->template('login');	# Force them to the login page.
+        return OK;
+    }
 }
 
-BeerDB->config->application_name('Authorization Test Beer Database');
-BeerDB->config->uri_base("http://localhost/beerdb/");
+# end authorization stuff
 
-#---------------------------------
 
-# This is the data an Authentication module must supply for us ...
-# Tell us where to find the user class:
-Maypole::Config->mk_accessors('auth');
-BeerDB->config->auth({
-    user_class  => 'BeerDB::Users',
-});
-
-# And tell us who the user is:
-Maypole->mk_accessors('user');
-
-#---------------------------------
-
-# Declare some actions to allow testing of get_authorized classes and
-# get_authorized_methods
-{
-    package BeerDB::Beer;
-    sub classes :Exported {}
-    sub methods :Exported {}
-}
-
-{
-    package BeerDB::Style;
-    sub classes :Exported {}
-    sub methods :Exported {}
-}
-
-#---------------------------------
+use Class::DBI::Loader::Relationship;
+BeerDB->config->{loader}->relationship($_) for (
+        "a brewery produces beers",
+        "a style defines beers",
+        "a pub has beers on handpumps");
 
 1;

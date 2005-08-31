@@ -1,6 +1,6 @@
-# Before `make install' is performed this script should be runnable with
-# `make test'. After `make install' it should work as
-# `perl t/02-basic-tests-with-maypole.t'
+# Before 'make install' is performed this script should be runnable with
+# 'make test'. After 'make install' it should work as
+# 'perl t/02-basic-tests-with-maypole.t'
 use strict;
 use warnings;
 
@@ -14,14 +14,14 @@ use warnings;
 
 #########################
 
-use Test::More tests => 22;
+use Test::More tests => 23;
 my $DEBUG = 0;
 my $MPA = 'Maypole::Plugin::Authorization';
 
 # First check that Maypole passes its most basic tests
 # (borrowed from Maypole-2.09/t/01basics.t)
 
-use lib 'ex'; # Where BeerDB.pm should live
+use lib 't'; # Where BeerDB.pm should live
 BEGIN {
     require_ok( 'BeerDB' );
 }
@@ -32,15 +32,15 @@ $ENV{MAYPOLE_TEMPLATES} = 't/templates';
 isa_ok( (bless {}, 'BeerDB') , 'Maypole')
 or diag("Maypole can't create a request object properly - rerun its tests");
 
-# Run one Maypole test just to be sure
+# Run one Maypole test to be sure it is running
 like(BeerDB->call_url("http://localhost/beerdb/"), qr/frontpage/,
-     "Got frontpage, Maypole appears to work!")
-or diag("Maypole isn't working - rerun its tests");
+     "Got frontpage, Maypole is running")
+or diag("Maypole isn't working - please rerun its tests");
 
-
-
-#my (%classdata)=split /\n/, BeerDB->call_url("http://localhost/beerdb/beer/classdata");
-#is ($classdata{plural},'beers','classdata.plural');
+# And one to ensure it can access the test database
+my $page = BeerDB->call_url("http://localhost/beerdb/brewery/view/1");
+like($page,qr/St Peter/,'Found a brewery, Maypole seems to work')
+or diag("Maypole isn't working - please rerun its tests");
 
 
 # Now start tests of Maypole::Plugin::Authorization

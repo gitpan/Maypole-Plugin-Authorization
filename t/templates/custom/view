@@ -1,5 +1,4 @@
-# Begin object list
-[% FOR obj = objects %]
-- [% obj.name %]
-[% END %]
-# End object list
+This template is to check that Maypole can access the test database
+
+ZZ [% objects.0.name %] YY
+
